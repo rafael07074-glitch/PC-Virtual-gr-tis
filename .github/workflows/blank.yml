@@ -1,0 +1,128 @@
+from pathlib import Path
+
+content = r'''name: Titan Cloud PC - Mobile RDP + Tailscale
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-pc:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Prepare Windows, RDP account and Tailscale
+        shell: powershell
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "=== Titan Cloud PC starting ==="
+
+          # Validate required secrets before making changes.
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "Missing TS_AUTHKEY. Add it in Repository Settings > Secrets and variables > Actions."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Missing RDP_PASSWORD. Add a strong password in Repository Settings > Secrets and variables > Actions."
+          }
+
+          if ($env:RDP_PASSWORD.Length -lt 12) {
+            throw "RDP_PASSWORD must be at least 12 characters long."
+          }
+
+          # Create or update the dedicated RDP user.
+          $username = "CloudUser"
+          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $existingUser = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+
+          if ($existingUser) {
+            Set-LocalUser -Name $username -Password $securePassword
+            Enable-LocalUser -Name $username
+            Write-Host "Updated existing RDP account."
+          } else {
+            New-LocalUser -Name $username `
+              -Password $securePassword `
+              -Description "Titan Cloud PC remote desktop account" `
+              -PasswordNeverExpires
+            Write-Host "Created RDP account."
+          }
+
+          # Grant standard Remote Desktop access; do not make this user an administrator.
+          $rdpGroup = Get-LocalGroup -SID "S-1-5-32-555"
+          Add-LocalGroupMember -Group $rdpGroup.Name -Member $username -ErrorAction SilentlyContinue
+
+          # Enable Remote Desktop and the built-in firewall rules.
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" -Value 0
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          # Download and install Tailscale.
+          $installer = Join-Path $env:TEMP "tailscale-setup.exe"
+          Write-Host "Downloading Tailscale..."
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" `
+            -OutFile $installer
+
+          Write-Host "Installing Tailscale..."
+          $install = Start-Process -FilePath $installer -ArgumentList "/quiet" -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            throw "Tailscale installer returned exit code $($install.ExitCode)."
+          }
+
+          $tailscaleExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (!(Test-Path $tailscaleExe)) {
+            throw "Tailscale executable was not found after installation."
+          }
+
+          # Authenticate this temporary runner to the user's tailnet.
+          # Use a one-off/ephemeral key where supported, and never print the key.
+          Write-Host "Connecting to Tailscale..."
+          & $tailscaleExe up "--auth-key=$env:TS_AUTHKEY" "--hostname=titan-cloud-pc"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed. Check TS_AUTHKEY, key expiry, and tailnet policy."
+          }
+
+          Start-Sleep -Seconds 8
+
+          $ip = (& $tailscaleExe ip -4 | Select-Object -First 1).Trim()
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+            throw "No Tailscale IPv4 address was returned."
+          }
+
+          # Confirm the Remote Desktop service is running.
+          Set-Service -Name TermService -StartupType Manual
+          Start-Service -Name TermService
+          $service = Get-Service -Name TermService
+          if ($service.Status -ne "Running") {
+            throw "Remote Desktop Services is not running."
+          }
+
+          Write-Host ""
+          Write-Host "========== TITAN CLOUD PC READY =========="
+          Write-Host "PC name      : titan-cloud-pc"
+          Write-Host "Tailscale IP : $ip"
+          Write-Host "RDP username : $username"
+          Write-Host "RDP port     : 3389"
+          Write-Host "RDP password : use your RDP_PASSWORD secret"
+          Write-Host "=========================================="
+          Write-Host "On the phone, connect Tailscale to the same authorized tailnet first."
+          Write-Host "Then open a compatible RDP client and enter the IP, username and password."
+          Write-Host "Do not share logs or secrets publicly."
+
+          # Keep the temporary GitHub-hosted runner active until timeout.
+          while ($true) {
+            Start-Sleep -Seconds 60
+          }
+'''
+p = Path("/mnt/data/Titan-Cloud-PC-Mobile.txt")
+p.write_text(content, encoding="utf-8")
+print(f"Arquivo TXT completo criado: {p}")
